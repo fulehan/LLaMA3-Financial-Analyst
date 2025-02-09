@@ -202,6 +202,153 @@ trainer_stats = trainer.train()
 
 ### Part 2: RAG Pipeline
 
+Now that we have our fine tuned language model, inference functions, and a desired prompt format, we need to now set up the RAG pipeline to inject the relevant context into each generation.
+
+The flow will follow as such:
+
+*User Question* -> *Context Retrieval from 10-K* -> *LLM Answers User Question Using Context*
+
+To do this we will need to be able to:
+1. Gather specific from 10-K's
+2. Parse and chunk the text in them
+3. Vectorize and embed the chunks into a vector Database
+4. Set up a retriever to semantically search the user's questions over the database to return relevant context
+
+A **Form 10-K** is an annual report required by the U.S. Securities and Exchange Commission, that gives a comprehensive summary of a company's financial performance.
+
+1. Function For 10-K Retrieval. To do this easier, we're taking advantage of the [SEC API](https://sec-api.io/.). It is free to sign up, and you get 100 API calls a day to use, each time we load a ticker's symbol it will use 3 calls.
+
+For this project, we'll be focused on loading only sections **1A** and **7**
+- **1A**: Risk Factors
+- **7**: Management's Discussion and Analysis of Financial Condition and Results of Operations
+
+```python
+# Extract Filings Function
+def get_filings(ticker):
+    global sec_api_key
+
+    # Finding Recent Filings with QueryAPI
+    queryApi = QueryApi(api_key=sec_api_key)
+    query = {
+      "query": f"ticker:{ticker} AND formType:\"10-K\"",
+      "from": "0",
+      "size": "1",
+      "sort": [{ "filedAt": { "order": "desc" } }]
+    }
+    filings = queryApi.get_filings(query)
+
+    # Getting 10-K URL
+    filing_url = filings["filings"][0]["linkToFilingDetails"]
+
+    # Extracting Text with ExtractorAPI
+    extractorApi = ExtractorApi(api_key=sec_api_key)
+    onea_text = extractorApi.get_section(filing_url, "1A", "text") # Section 1A - Risk Factors
+    seven_text = extractorApi.get_section(filing_url, "7", "text") # Section 7 - Management’s Discussion and Analysis of Financial Condition and Results of Operations
+
+    # Joining Texts
+    combined_text = onea_text + "\n\n" + seven_text
+
+    return combined_text
+```
+
+2. Setting Up Embeddings Locally. In the spirit of local and fine tuned models, we'll be using an open source embedding model, [Beijing Academy of Artificial Intelligence's - Large English Embedding Model](https://huggingface.co/BAAI/bge-large-en-v1.5). More details on their open source model available in their [GitHub repo](https://github.com/FlagOpen/FlagEmbedding)!
+
+**Embeddings** are numerical representations of data, typically used to convert complex, high-dimensional data into a lower-dimensional space where similar data points are closer together. In the context of natural language processing (NLP), embeddings are used to represent words, phrases, or sentences as vectors of real numbers. These vectors capture semantic relationships, meaning that words with similar meanings are represented by vectors that are close together in the embedding space.
+
+**Embedding models** are machine learning models that are trained to create these numerical representations. They learn to encode various types of data into embeddings that capture the essential characteristics and relationships within the data. For example, in NLP, embedding models like Word2Vec, GloVe, and BERT are trained on large text corpora to produce word embeddings. These embeddings can then be used for various downstream tasks, such as text classification, sentiment analysis, or machine translation. In this case we'll be using it for semantic similarity
+
+```python
+# HF Model Path
+modelPath = "BAAI/bge-large-en-v1.5"
+# Create a dictionary with model configuration options, specifying to use the cuda for GPU optimization
+model_kwargs = {'device':'cuda'}
+encode_kwargs = {'normalize_embeddings': True}
+
+# Initialize an instance of LangChain's HuggingFaceEmbeddings with the specified parameters
+embeddings = HuggingFaceEmbeddings(
+    model_name=modelPath,     # Provide the pre-trained model's path
+    model_kwargs=model_kwargs, # Pass the model configuration options
+    encode_kwargs=encode_kwargs # Pass the encoding options
+)
+```
+
+3. Processing and Defining Vector Database. In this flow we get the data from the above defined SEC API functions, and then go through Three steps:
+- Text Splitting
+- Vectorizing
+- Retrieval Function Setup
+
+**Text splitting** is the process of breaking down large documents or text data into smaller, manageable chunks. This is often necessary when dealing with extensive text data, such as legal documents, financial reports, or any lengthy articles. The purpose of text splitting is to ensure that the data can be effectively processed, analyzed, and indexed by machine learning models and databases.
+
+**Vector databases** store data in the form of vectors, which are numerical representations of text, images, or other types of data. These vectors capture the semantic meaning of the data, allowing for efficient similarity search and retrieval.
+
+The Vector DB we're using here is the [Facebook AI Semantic Search](https://ai.meta.com/tools/faiss/) library, a lightweight an in memory (don't need to save this to a disk) solution that is not as powerful as other Vector DB's but will work great for this use case
+
+```python
+# Prompt the user to input the stock ticker they want to analyze
+ticker = input("What Ticker Would you Like to Analyze? ex. AAPL: ")
+
+print("-----")
+print("Getting Filing Data")
+# Retrieve the filing data for the specified ticker
+filing_data = get_filings(ticker)
+
+print("-----")
+print("Initializing Vector Database")
+# Initialize a text splitter to divide the filing data into chunks
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size = 1000,         # Maximum size of each chunk
+    chunk_overlap = 500,       # Number of characters to overlap between chunks
+    length_function = len,     # Function to determine the length of the chunks
+    is_separator_regex = False # Whether the separator is a regex pattern
+)
+# Split the filing data into smaller, manageable chunks
+split_data = text_splitter.create_documents([filing_data])
+
+# Create a FAISS vector database from the split data using embeddings
+db = FAISS.from_documents(split_data, embeddings)
+
+# Create a retriever object to search within the vector database
+retriever = db.as_retriever()
+
+print("-----")
+print("Filing Initialized")
+```
+
+4. Retreival. It  is the process of querying a vector database to find and return relevant text chunks or documents that match a given query. This involves searching through the indexed embeddings to identify the ones that are most similar to the query.
+
+**How It Works:**
+1. **Query Embedding:** When a query is made, it is first converted into an embedding using the same embedding model used for the text chunks.
+2. **Similarity Search:** The retriever searches the vector database for embeddings that are similar to the query embedding. This similarity is often measured using distance metrics like cosine similarity or Euclidean distance.
+3. **Document Retrieval:** The retriever then retrieves the original text chunks or documents associated with the similar embeddings.
+4. **Context Assembly:** The retrieved text chunks are assembled to provide a coherent context or answer to the query.
+
+In this function, the query is used to invoke the retriever, which returns a list of documents. The content of these documents is then extracted and returned as the context for the query.
+
+```python
+# Retrieval Function
+def retrieve_context(query):
+    global retriever
+    retrieved_docs = retriever.invoke(query) # Invoke the retriever with the query to get relevant documents
+    context = []
+    for doc in retrieved_docs:
+        context.append(doc.page_content) # Collect the content of each retrieved document
+    return context
+```
+
+5. Combining Functions. Now, we'll string everything together into a very simple while loop that will take the user's question, retrieve context from the Vector DB populated with the specific company Form 10-K, then run inference through our fine tuned model to generate a response! Give it a shot
+
+```python
+while True:
+  question = input(f"What would you like to know about {ticker}'s form 10-K? ")
+  if question == "x":
+    break
+  else:
+    context = retrieve_context(question) # Context Retrieval
+    resp = inference(question, context) # Running Inference
+    parsed_response = extract_response(resp) # Parsing Response
+    print(f"LLaMa3 Agent: {parsed_response}")
+    print("-----\n")
+```
 
 ## Results
 
